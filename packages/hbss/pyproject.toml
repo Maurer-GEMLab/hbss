@@ -41,7 +41,7 @@ hbss = "hbss.cli:main"          # Phase 0
 hbss-fetch = "hbss.io.fetch:main"  # Phase 0
 
 [project.urls]
-Repository = "https://github.com/OWNER/hbss"
+Repository = "https://github.com/Maurer-GEMLab/hbss"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hbss"]

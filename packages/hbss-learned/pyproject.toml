@@ -30,7 +30,7 @@ dependencies = [
 train = ["tensorboard", "tqdm"]
 
 [project.urls]
-Repository = "https://github.com/OWNER/hbss"
+Repository = "https://github.com/Maurer-GEMLab/hbss"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hbss_learned"]
