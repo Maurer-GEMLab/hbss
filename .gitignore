@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+
+# Environments
+.pixi/
+.env
+
+# Data never lives in the repository -- register it in
+# packages/hbss/src/hbss/io/registry.yaml and fetch with `hbss-fetch`.
+# Anchored to the root so it does not swallow source modules named `data`.
+/data/
+*.zarr/
+*.h5
+*.hdf5
+*.nc
+*.tif
+*.tiff
+*.SAFE/
+
+# Run outputs
+runs/
+outputs/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+wandb/
+lightning_logs/
+
+# Docs
+docs/_build/
+docs/api/_autosummary/
+
+# Rendered copies of the planning documents (regenerate with pandoc/quarto)
+*.html
+*_files/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+!.vscode/extensions.json

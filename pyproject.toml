@@ -1,0 +1,75 @@
+# Workspace root. Not itself a distributable package -- see packages/.
+[project]
+name = "hbss-workspace"
+version = "0.0.0"
+description = "Workspace root for the HBSS project"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-cov",
+    "hypothesis>=6",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pre-commit",
+]
+docs = [
+    "sphinx>=7",
+    "furo",
+    "myst-parser",
+    "sphinx-autodoc-typehints",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+hbss = { workspace = true }
+hbss-learned = { workspace = true }
+
+# --------------------------------------------------------------------------
+# Lint / format
+# --------------------------------------------------------------------------
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+# The research sandbox is deliberately exempt. See HBSS-dev-plan.md section 1.4.
+extend-exclude = ["experiments"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "NPY", "RUF"]
+
+# --------------------------------------------------------------------------
+# Types
+# --------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+files = ["packages"]
+strict = false          # tighten once the interfaces settle
+warn_unused_ignores = true
+warn_redundant_casts = true
+exclude = ["experiments/"]
+
+[[tool.mypy.overrides]]
+module = ["jax.*", "numpyro.*", "torch.*", "zarr.*", "xarray.*", "RAiDER.*"]
+ignore_missing_imports = true
+
+# --------------------------------------------------------------------------
+# Tests
+# --------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["packages/hbss/tests", "packages/hbss-learned/tests", "tests"]
+norecursedirs = ["experiments", "benchmarks", ".git", "*.egg-info"]
+addopts = "-ra --strict-markers"
+markers = [
+    "statistical: tier 1 -- SBC, dense-reference, property tests (~5 min, every PR)",
+    "integration: tier 2 -- end-to-end synthetic scenes (~20 min, nightly)",
+    "benchmark: tier 3 -- performance and real-data regression (hours, weekly)",
+    "needs_data: requires $HBSS_DATA_ROOT to be populated",
+    "needs_gpu: requires an accelerator",
+]

@@ -1,0 +1,23 @@
+name: Nightly
+
+# Tier 2 integration tests. Tier 3 (benchmarks, real-data regression) runs
+# weekly on a self-hosted GPU runner once one exists -- never on the pull
+# request path, so that a dead lab machine cannot block a merge.
+# See HBSS-dev-plan.md sections 2.1 and 3.
+
+on:
+  schedule:
+    - cron: "0 7 * * *"   # 07:00 UTC daily
+  workflow_dispatch:
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.*"
+      - run: uv sync --all-packages
+      - run: uv run pytest -m "integration and not needs_data and not needs_gpu"

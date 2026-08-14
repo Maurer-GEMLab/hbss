@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hbss-learned"
+version = "0.0.0.dev0"
+description = "Learned noise covariance (LNCM) and unwrapping-error proposal (LUEP) models for HBSS"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Jeremy Maurer", email = "jmaurer@mst.edu" }]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Depends on hbss; hbss does not depend on this. The arrow points one way.
+dependencies = [
+    "hbss",
+    "torch>=2.3",
+    "numpy>=1.26",
+    "xarray>=2024.1",
+    "zarr>=2.17",
+]
+
+[project.optional-dependencies]
+train = ["tensorboard", "tqdm"]
+
+[project.urls]
+Repository = "https://github.com/OWNER/hbss"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hbss_learned"]

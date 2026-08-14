@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.5.*"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv sync --all-packages
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv sync --all-packages
+      # packages/ only -- experiments/ is deliberately exempt
+      - run: uv run mypy
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv sync --all-packages --python ${{ matrix.python }}
+      # Tiers 0 and 1: unit plus statistical. Integration and benchmarks are nightly.
+      - run: uv run pytest -m "not integration and not benchmark and not needs_data and not needs_gpu"
+
+  core-isolation:
+    # The dependency rule, enforced rather than remembered: hbss must pass its
+    # entire suite in an environment where torch does not exist.
+    # See HBSS-dev-plan.md section 1.3.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Install hbss alone, with no learned stack
+        run: |
+          uv venv
+          uv pip install ./packages/hbss pytest hypothesis
+      - name: Assert torch is genuinely absent
+        run: |
+          if uv run python -c "import torch" 2>/dev/null; then
+            echo "::error::torch is installed in the isolation environment; the job is not testing what it claims to"
+            exit 1
+          fi
+          echo "confirmed: torch not importable"
+      - name: Run the core suite
+        run: uv run pytest packages/hbss/tests -m "not integration and not benchmark and not needs_data and not needs_gpu"
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv sync --all-packages --group docs
+      - run: uv run sphinx-build -W -b html docs docs/_build/html

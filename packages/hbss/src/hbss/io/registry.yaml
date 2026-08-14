@@ -1,0 +1,20 @@
+# Dataset registry.
+#
+# Data never lives in the repository. This file maps logical names to a
+# location, a checksum, and provenance; `hbss-fetch <name>` resolves an entry
+# and populates $HBSS_DATA_ROOT.
+#
+# Add an entry the moment a dataset is first used, not later. The run ledger
+# records the checksums of everything an inference run consumed, and that is
+# only as good as this file.
+#
+# Storage location is a Phase 0 decision -- see HBSS-dev-plan.md section 3.
+
+datasets: {}
+  # socal-s1-t137:
+  #   description: Sentinel-1 track 137, southern California, 2019-2024
+  #   uri: s3://TBD/socal/t137/
+  #   sha256: TBD
+  #   size_gb: TBD
+  #   provenance: ASF, processed with Dolphin vX.Y
+  #   used_by: real-data test 1 (HBSS-plan.md section 1.6)

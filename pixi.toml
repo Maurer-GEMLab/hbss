@@ -1,0 +1,50 @@
+# conda-forge stack plus the PyPI layer, in one lockfile.
+#
+# The geodesy dependencies (ISCE3, Dolphin, GDAL) are conda-forge only, so a
+# pure-PyPI setup is not an option. pixi is the recommended tool for that mix;
+# environment.yml + uv is the fallback if it causes friction. Decide in week 1
+# and record it in ADR-0002.
+#
+# Two environments, deliberately not merged. Co-installing CUDA-enabled JAX and
+# CUDA-enabled torch is a recurring time sink, and the offline artifact-export
+# design means there is no reason to. See HBSS-dev-plan.md section 3.
+#
+# Status: skeleton. Versions are unpinned until Phase 0 pins them against a
+# real machine.
+
+[project]
+name = "hbss"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
+
+[dependencies]
+python = ">=3.11,<3.13"
+numpy = "*"
+scipy = "*"
+xarray = "*"
+zarr = "*"
+pandas = "*"
+h5py = "*"
+gdal = "*"
+
+[feature.core.dependencies]
+jax = "*"
+numpyro = "*"
+
+[feature.insar.dependencies]
+# isce3 = "*"
+# dolphin = "*"
+# raider = "*"
+
+[feature.learned.dependencies]
+pytorch = "*"
+
+[feature.dev.dependencies]
+pytest = "*"
+hypothesis = "*"
+ruff = "*"
+mypy = "*"
+
+[environments]
+core = ["core", "insar", "dev"]
+learned = ["learned", "dev"]
