@@ -147,11 +147,32 @@ def _patch_weight(
     seed: Optional[int],
 ) -> np.ndarray:
     """
-    Build a smooth [0, 1] weight map covering roughly ``fraction`` of the grid.
-
-    A spatially correlated power-law field is thresholded at its
+    Builds a smooth [0, 1] weight map covering roughly ``fraction`` of the grid.
+    More concretely, creates the patches to simulate irregular snow/vegetative cover. 
+    
+    Implementational Note: A spatially correlated power-law field is thresholded at its
     (1 - fraction) quantile and passed through a logistic function so patch
     boundaries are gradual rather than hard-edged.
+
+    Parameters
+    ----------
+    shape : tuple (ny, nx)
+        Output array shape.
+    fraction : float
+        The fraction of the scene covered in snow/vegetation.
+    beta : float
+        The 'topographic' smoothness of patches. Higher beta equals more smoothness, or broader, rounder 'hills'.
+        For snow, beta generally set to 4. For vegetation, beta generally set to 3. 
+    edge_softness : float
+        The degree to how gradually a patch fades at its boundary. Larger values create a softer boundary. 
+        Default setting is 0.15. 
+    seed : int
+        For reproducibility.
+        
+    Returns
+    -------
+    An np array weight map of shape (ny, nx) with one value between 0 and 1 per pixel, designating how strongly
+    a pixel belongs to a patch. 1 means a pixel is fully inside a patch; 0, fully outside a patch.
     """
     if fraction <= 0.0:
         return np.zeros(shape)
@@ -175,11 +196,39 @@ def _rupture_weight(
     center_km: Tuple[float, float],
 ) -> np.ndarray:
     """
-    Gaussian [0, 1] weight around a straight surface-rupture segment.
+    Builds a Gaussian [0, 1] weight map around a straight surface-rupture segment.
+    More concretely, creates the zone of deformation surrounding a straight surface-rupture event.
 
-    Uses the distance from each pixel to the finite segment, so the
+    Implementational Note: Uses the distance from each pixel to the finite segment, so the
     decorrelated zone has rounded ends. ``width_km`` is the full width at
-    which the weight falls to exp(-2) ≈ 0.14 (i.e. sigma = width / 4).
+    which the weight falls to exp(-2) ≈ 0.14 (i.e. sigma = width / 4), that is, it designates the extent
+    of the total affected zone.
+
+    Parameters
+    ----------
+    shape : tuple (ny, nx)
+        Output array shape. 
+    pixel_size_km : float
+        The ground size of one pixel. Combined with shape, it enables the function to compute the distance 
+        from each pixel to the grid center, which is used to compute distance from rupture in kilometers. 
+        Generators supply proper value automatically.
+    strike_deg : float
+        The strike of the rupture, clockwise from the North. Defaults to the earthquake strike_deg so that the 
+        rupture aligns with the fault.
+    length_km : float
+        The full length of the rupture. Segment extends half the length on each side of the rupture center, with 
+        slight extension beyond stated length due to rounded ends. Setting this to 0 disables the addition of a 
+        rupture to the scene.
+    width_km : float
+        The width of the affected zone. Influence fades to ~0.14 at half the width on each side of the rupture.
+    center_km : tuple (x, y)
+        The midpoint of the rupture measured from the center of the grid, which is (0, 0). 
+
+    Returns
+    -------
+    An np array weight map of shape (ny, nx) with one value between 0 and 1 per pixel, designating how strongly
+    the rupture affects the pixel. Pixels directly in the rupture are denoted with 1. Pixels completely unaffected
+    are denoted with 0. Moving away from the rupture reduces impact smoothly along a Guassian curve.     
     """
     ny, nx = shape
     x_km = np.arange(nx) * pixel_size_km - (nx - 1) * pixel_size_km / 2
@@ -232,7 +281,7 @@ def generate_decorrelation_noise(
     seed: Optional[int] = None,
 ) -> Dict[str, np.ndarray]:
     """
-    Generate decorrelation phase noise from a synthetic coherence map.
+    Generates decorrelation phase noise from a synthetic coherence map.
 
     A coherence map gamma(x, y) is built from a uniform background value
     and up to three decorrelation sources, which combine multiplicatively
@@ -320,7 +369,7 @@ def generate_decorrelation_noise(
         Softness of random patch boundaries in units of the underlying
         field's standard deviation. 0 gives hard-edged patches.
     seed : int, optional
-        Random seed for reproducibility.
+        For reproducibility.
 
     Returns
     -------
@@ -340,7 +389,8 @@ def generate_decorrelation_noise(
     ...     rupture_length_km=30, rupture_strike_deg=45, seed=0)
     >>> phase_noisy = wrap_phase(phase_noisy + res["phase_noise_rad"])
     """
-    ny, nx = shape
+    # Check inputs are valid.
+    ny, nx = shape 
     if n_looks < 1:
         raise ValueError(f"n_looks={n_looks} must be >= 1.")
     for name, val in [
@@ -358,10 +408,14 @@ def generate_decorrelation_noise(
             "temporal_baseline_days must be >= 0 and vegetation_tau_days > 0."
         )
 
+    # Verify any pre-created passed-in masks validly interoperate with interferogram. 
     def _check_mask(mask, name):
+        # Convert mask contents to float by default.
         mask = np.asarray(mask, dtype=float)
+        # Verify mask shape matches interferogram shape.
         if mask.shape != (ny, nx):
             raise ValueError(f"{name} shape {mask.shape} does not match {shape}.")
+        # Clip any mask values beyond the range [0.0, 1.0] to enforce valid weight range.
         return np.clip(mask, 0.0, 1.0)
 
     rng = np.random.default_rng(seed)
@@ -381,36 +435,45 @@ def generate_decorrelation_noise(
                                edge_softness, snow_seed)
 
     if rupture_length_km > 0.0:
-        w_rup = _rupture_weight(shape, pixel_size_km, rupture_strike_deg,
-                                rupture_length_km, rupture_width_km,
+        w_rup = _rupture_weight(shape, pixel_size_km, rupture_strike_deg, rupture_length_km, rupture_width_km,
                                 rupture_center_km)
     else:
-        w_rup = np.zeros(shape)
+        w_rup = np.zeros(shape) # No rupture.
 
     # --- Coherence map ---
-    gamma_veg = vegetation_coherence_long_term + (
-        1.0 - vegetation_coherence_long_term
-    ) * np.exp(-temporal_baseline_days / vegetation_tau_days)
+    # Compute change in vegetation coherence with change in time. 1 for no time gap; decays torward floor as gap grows. 
+    gamma_veg = vegetation_coherence_long_term + (1.0 - vegetation_coherence_long_term) * np.exp(-temporal_baseline_days / vegetation_tau_days)
 
+    # Combine the noise from vegetation, snow, and rupture multiplicatively with the base background coherence into 
+    # one official coherence map. (Weight map and source's coherence combined.) (1- gamma_src) = how much coherence src
+    # removes at full strength. Weight scales it per pixel, where 1 is full effect. 
     coherence = (
         background_coherence
         * (1.0 - w_veg * (1.0 - gamma_veg))
         * (1.0 - w_snow * (1.0 - snow_coherence))
         * (1.0 - w_rup * (1.0 - rupture_coherence))
     )
-    coherence = np.clip(coherence, 0.0, 1.0)
+    coherence = np.clip(coherence, 0.0, 1.0) # Ensure coherence values remain in valid range.
 
     # --- Exact multilook phase simulation ---
     # s1 ~ CN(0,1); s2 = gamma*s1 + sqrt(1-gamma^2)*n  =>  corr(s1, s2) = gamma
     scale = np.sqrt(1.0 - coherence**2)
     interferogram = np.zeros(shape, dtype=complex)
     for _ in range(int(n_looks)):
-        s1 = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)) / np.sqrt(2)
+        # The first aquisition's echo for every pixel.
+        s1 = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)) / np.sqrt(2) 
+        # A second (and nth), completely indepedent random echo.
         n = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)) / np.sqrt(2)
+        # The second (and nth) ascquisition that is a blend of the two (and n).  
+        # At gamma=1, s2 is exact copy of s1. At gamma=0, s2 is pure noise and unrelated to s1.
         s2 = coherence * s1 + scale * n
+        # Forms the interferogram with the phase difference of the two echoes. 
+        # (Addition for each arrow as a running total is multilooking.) 
         interferogram += s1 * np.conj(s2)
 
+    # Gets direction of summed arrow between -pi and pi.
     phase_noise_rad = np.angle(interferogram)
+    # Line-of-sight displacement in meters. 
     noise_m = -phase_noise_rad * wavelength_m / (4.0 * np.pi)
 
     return {
