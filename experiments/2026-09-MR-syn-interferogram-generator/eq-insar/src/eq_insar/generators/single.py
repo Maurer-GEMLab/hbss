@@ -1,0 +1,461 @@
+"""
+Single interferogram generator for EQ-INSAR.
+
+Generates synthetic InSAR data for a single earthquake event using
+the Davis (1986) point source model.
+"""
+
+import numpy as np
+from typing import Any, Dict, Optional, Union
+
+from ..constants import (
+    DEFAULT_SHEAR_MODULUS_PA,
+    DEFAULT_POISSON_RATIO,
+    get_satellite,
+    SatelliteConfig,
+)
+from ..core import (
+    davis_point_source,
+    mw_to_m0,
+    m0_to_mw,
+    double_couple_moment_tensor,
+)
+from ..core.moment_tensor import fault_dimensions_from_magnitude
+from ..insar import (
+    compute_los_displacement,
+    displacement_to_phase,
+    wrap_phase,
+    generate_random_noise,
+    generate_correlated_noise,
+    generate_orbital_ramp,
+    generate_decorrelation_noise,
+)
+
+
+def _resolve_decorrelation_params(
+    decorrelation_params: Optional[Dict[str, Any]],
+    Mw: float,
+    strike_deg: float,
+    xcen_km: float,
+    ycen_km: float,
+    wavelength_m: float,
+    grid_spacing_km: float,
+) -> Dict[str, Any]:
+    """
+    Build keyword arguments for ``generate_decorrelation_noise``.
+
+    Fills in values the generator already knows (wavelength, pixel size)
+    and ties the rupture to the earthquake source unless overridden:
+
+    - ``rupture_strike_deg`` defaults to the fault ``strike_deg``
+    - ``rupture_center_km`` defaults to ``(xcen_km, ycen_km)``
+    - ``rupture_length_km="auto"`` uses the Wells & Coppersmith (1994)
+      rupture length for ``Mw``
+    """
+    params = dict(decorrelation_params or {})
+    params.pop("shape", None)
+    params.pop("seed", None)
+    params.setdefault("wavelength_m", wavelength_m)
+    params.setdefault("pixel_size_km", grid_spacing_km)
+
+    length = params.get("rupture_length_km", 0.0)
+    if isinstance(length, str):
+        if length.lower() != "auto":
+            raise ValueError(
+                f"rupture_length_km={length!r}: must be a number or 'auto'."
+            )
+        length, _ = fault_dimensions_from_magnitude(Mw)
+        params["rupture_length_km"] = float(length)
+    if params.get("rupture_length_km", 0.0) > 0.0:
+        params.setdefault("rupture_strike_deg", strike_deg)
+        params.setdefault("rupture_center_km", (xcen_km, ycen_km))
+
+    return params
+
+
+def _validate_source_parameters(
+    Mw: Optional[float],
+    M0: Optional[float],
+    strike_deg: float,
+    dip_deg: float,
+    rake_deg: float,
+    depth_km: float,
+) -> None:
+    """Validate earthquake source parameters and raise ValueError if invalid."""
+    if Mw is not None:
+        if not (-5.0 <= Mw <= 10.0):
+            raise ValueError(
+                f"Mw={Mw} is outside the valid range [-5, 10]. "
+                f"Negative magnitudes are valid for microearthquakes."
+            )
+    if M0 is not None and M0 <= 0:
+        raise ValueError(f"M0 must be positive, got {M0}")
+    if Mw is None and M0 is None:
+        raise ValueError("Must provide either Mw or M0")
+    if not (0.0 <= dip_deg <= 90.0):
+        raise ValueError(
+            f"dip_deg={dip_deg} is outside the valid range [0, 90]."
+        )
+    if not (0.0 <= strike_deg <= 360.0):
+        raise ValueError(
+            f"strike_deg={strike_deg} is outside the valid range [0, 360]."
+        )
+    if not (-180.0 <= rake_deg <= 180.0):
+        raise ValueError(
+            f"rake_deg={rake_deg} is outside the valid range [-180, 180]."
+        )
+    if not (0.0 < depth_km <= 700.0):
+        raise ValueError(
+            f"depth_km={depth_km} is outside the valid range (0, 700]. "
+            f"No earthquakes occur below ~700 km (mantle transition zone). "
+            f"For InSAR surface deformation, typical depths are 3–30 km."
+        )
+
+
+def generate_synthetic_insar(
+    # Source parameters
+    Mw: Optional[float] = None,
+    M0: Optional[float] = None,
+    strike_deg: float = 0.0,
+    dip_deg: float = 45.0,
+    rake_deg: float = 90.0,
+    # Source location
+    xcen_km: float = 0.0,
+    ycen_km: float = 0.0,
+    depth_km: float = 10.0,
+    # Grid parameters
+    grid_size: Optional[int] = None,
+    grid_extent_km: float = 50.0,
+    grid_spacing_km: Optional[float] = None,
+    # Elastic parameters
+    nu: float = DEFAULT_POISSON_RATIO,
+    mu: float = DEFAULT_SHEAR_MODULUS_PA,
+    # InSAR geometry - can specify satellite or manual
+    satellite: Optional[str] = None,
+    orbit: str = "ascending",
+    incidence_deg: Optional[float] = None,
+    heading_deg: Optional[float] = None,
+    wavelength_m: Optional[float] = None,
+    # Noise parameters
+    add_noise: bool = True,
+    noise_amplitude_m: float = 0.003,
+    noise_model: str = "correlated",
+    noise_beta: float = 5 / 3,
+    add_orbital_ramp: bool = False,
+    # Decorrelation parameters
+    add_decorrelation: bool = False,
+    decorrelation_params: Optional[Dict[str, Any]] = None,
+    # Output options
+    wrap: bool = True,
+    seed: Optional[int] = None,
+) -> Dict:
+    """
+    Generate synthetic InSAR data for earthquake deformation.
+
+    This is the main generator function that creates a complete synthetic
+    interferogram including displacement field, phase, and noise.
+    Uses the Davis (1986) point source model.
+
+    Parameters
+    ----------
+    Mw : float, optional
+        Moment magnitude (provide either Mw or M0)
+    M0 : float, optional
+        Scalar seismic moment in N·m
+    strike_deg : float
+        Fault strike in degrees (0-360, clockwise from North)
+    dip_deg : float
+        Fault dip in degrees (0-90, from horizontal)
+    rake_deg : float
+        Slip rake in degrees (-180 to 180)
+        - 0°: left-lateral strike-slip
+        - 90°: thrust/reverse
+        - ±180°: right-lateral strike-slip
+        - -90°: normal fault
+    xcen_km, ycen_km : float
+        Epicenter location in km
+    depth_km : float
+        Source depth in km (positive downward)
+
+    grid_size : int, optional
+        Number of pixels for the grid (e.g., 128 for 128x128).
+        If provided, grid_spacing_km is calculated automatically.
+    grid_extent_km : float
+        Half-width of the grid in km (default: 50 km, so 100 km total)
+    grid_spacing_km : float, optional
+        Grid spacing in km. If not provided and grid_size is given,
+        calculated as: 2 * grid_extent_km / (grid_size - 1)
+
+    nu : float
+        Poisson's ratio (default: 0.25)
+    mu : float
+        Shear modulus in Pa (default: 30 GPa)
+
+    satellite : str, optional
+        Satellite name for automatic geometry. Options:
+        'sentinel1', 'alos2', 'terrasar', 'cosmo', 'radarsat2', 'nisar', etc.
+        If provided, overrides incidence_deg, heading_deg, wavelength_m
+    orbit : str
+        Orbit direction: 'ascending' or 'descending' (used with satellite)
+    incidence_deg : float, optional
+        Radar incidence angle in degrees (manual specification)
+    heading_deg : float, optional
+        Satellite heading in degrees (manual specification)
+    wavelength_m : float, optional
+        Radar wavelength in meters (manual specification)
+
+    add_noise : bool
+        Whether to add noise
+    noise_amplitude_m : float
+        Noise standard deviation in meters (default: 5 mm)
+    noise_model : str
+        Noise model: 'gaussian' (default, uncorrelated) or 'correlated'
+        (power-law spectrum modelling atmospheric turbulence)
+    noise_beta : float
+        Spectral index for correlated noise (default: 5/3, Kolmogorov).
+        Only used when noise_model='correlated'.
+    add_orbital_ramp : bool
+        Whether to add orbital ramp artifact
+
+    add_decorrelation : bool
+        Whether to add decorrelation phase noise (vegetation, snow, surface
+        rupture). Independent of ``add_noise``. Default: False.
+    decorrelation_params : dict, optional
+        Keyword arguments forwarded to
+        :func:`~eq_insar.insar.noise.generate_decorrelation_noise`
+        (e.g. ``vegetation_fraction``, ``temporal_baseline_days``,
+        ``snow_fraction``, ``rupture_length_km``). ``wavelength_m`` and
+        ``pixel_size_km`` are filled in from this call. When a rupture is
+        enabled, its strike and centre default to ``strike_deg`` and
+        ``(xcen_km, ycen_km)``; ``rupture_length_km='auto'`` uses the
+        Wells & Coppersmith (1994) length for ``Mw``.
+
+    wrap : bool
+        Whether to wrap phase to [-π, π]
+    seed : int, optional
+        Random seed for reproducibility
+
+    Returns
+    -------
+    result : dict
+        Dictionary containing:
+        - X_km, Y_km: coordinate grids (km)
+        - Ue, Un, Uz: displacement components (m)
+        - los_displacement: LOS displacement (m)
+        - phase_unwrapped: unwrapped phase (rad)
+        - phase_wrapped: wrapped phase (rad)
+        - phase_noisy: wrapped phase with noise (rad)
+        - coherence: coherence map in [0, 1] (only if add_decorrelation)
+        - decorrelation_weights: dict of per-source weight maps
+          (vegetation, snow, rupture; only if add_decorrelation)
+        - metadata: source and processing parameters
+
+    Examples
+    --------
+    >>> result = generate_synthetic_insar(
+    ...     Mw=6.0,
+    ...     strike_deg=45,
+    ...     dip_deg=30,
+    ...     rake_deg=90,
+    ...     depth_km=10,
+    ...     satellite='sentinel1',
+    ...     orbit='ascending'
+    ... )
+    """
+    # Validate source parameters
+    _validate_source_parameters(Mw, M0, strike_deg, dip_deg, rake_deg, depth_km)
+
+    if seed is not None:
+        np.random.seed(seed)
+
+    # Handle grid_size parameter
+    if grid_size is not None:
+        # Calculate grid_spacing_km from grid_size and grid_extent_km
+        grid_spacing_km = (2 * grid_extent_km) / (grid_size - 1)
+    elif grid_spacing_km is None:
+        # Default spacing if neither grid_size nor grid_spacing_km provided
+        grid_spacing_km = 0.5
+
+    # Get seismic moment
+    if M0 is None:
+        M0 = mw_to_m0(Mw)
+    else:
+        Mw = m0_to_mw(M0)
+
+    # Get satellite configuration or use manual parameters
+    if satellite is not None:
+        sat = get_satellite(satellite)
+        if incidence_deg is None:
+            incidence_deg = sat.incidence_deg
+        if heading_deg is None:
+            heading_deg = sat.get_heading(orbit)
+        if wavelength_m is None:
+            wavelength_m = sat.wavelength_m
+        satellite_name = sat.name
+    else:
+        # Defaults if nothing specified
+        if incidence_deg is None:
+            incidence_deg = 33.0
+        if heading_deg is None:
+            heading_deg = -13.0
+        if wavelength_m is None:
+            wavelength_m = 0.05546  # Sentinel-1
+        satellite_name = "custom"
+
+    # Create coordinate grids
+    if grid_size is not None:
+        # Use linspace for exact grid_size
+        xs_km = np.linspace(-grid_extent_km, grid_extent_km, grid_size)
+        ys_km = np.linspace(-grid_extent_km, grid_extent_km, grid_size)
+    else:
+        # Use arange with spacing
+        xs_km = np.arange(-grid_extent_km, grid_extent_km + grid_spacing_km, grid_spacing_km)
+        ys_km = np.arange(-grid_extent_km, grid_extent_km + grid_spacing_km, grid_spacing_km)
+    X_km, Y_km = np.meshgrid(xs_km, ys_km)
+
+    # Convert to meters for physics calculations
+    X_m = X_km * 1000.0
+    Y_m = Y_km * 1000.0
+    xcen_m = xcen_km * 1000.0
+    ycen_m = ycen_km * 1000.0
+    depth_m = depth_km * 1000.0
+
+    # Build moment tensor
+    Mxx, Myy, Mzz, Mxy, Myz, Mzx = double_couple_moment_tensor(
+        strike_deg, dip_deg, rake_deg, M0
+    )
+
+    # Compute displacement using Davis point source
+    Ue, Un, Uz = davis_point_source(
+        X_m, Y_m, xcen_m, ycen_m, depth_m,
+        Mxx, Myy, Mzz, Mxy, Myz, Mzx,
+        nu=nu, mu=mu
+    )
+
+    # Compute LOS displacement
+    d_los = compute_los_displacement(
+        Ue, Un, Uz,
+        incidence_deg=incidence_deg,
+        heading_deg=heading_deg
+    )
+
+    # Convert to phase
+    phase_unwrapped = displacement_to_phase(d_los, wavelength_m)
+    phase_wrapped = wrap_phase(phase_unwrapped) if wrap else phase_unwrapped
+
+    # Generate noise
+    ny, nx = X_km.shape
+
+    # Initialize noisy phase
+    phase_noisy = phase_unwrapped.copy()
+
+    if add_noise:
+        if noise_model == "correlated":
+            noise = generate_correlated_noise(
+                (ny, nx),
+                amplitude_m=noise_amplitude_m,
+                beta=noise_beta,
+                seed=seed,
+            )
+        else:
+            noise = generate_random_noise(
+                (ny, nx),
+                amplitude_m=noise_amplitude_m,
+                seed=seed,
+            )
+        noise_phase = displacement_to_phase(noise, wavelength_m)
+        phase_noisy = phase_noisy + noise_phase
+
+        # Orbital ramp
+        if add_orbital_ramp:
+            ramp = generate_orbital_ramp(
+                (ny, nx),
+                pixel_size_km=grid_spacing_km,
+                seed=seed + 300 if seed is not None else None
+            )
+            ramp_phase = displacement_to_phase(ramp, wavelength_m)
+            phase_noisy = phase_noisy + ramp_phase
+
+    # Decorrelation noise (independent of add_noise)
+    coherence = None
+    decorrelation_weights = None
+    decorr_kwargs = None
+    if add_decorrelation:
+        decorr_kwargs = _resolve_decorrelation_params(
+            decorrelation_params, Mw, strike_deg, xcen_km, ycen_km,
+            wavelength_m, grid_spacing_km,
+        )
+        decorr = generate_decorrelation_noise(
+            (ny, nx),
+            seed=seed + 400 if seed is not None else None,
+            **decorr_kwargs,
+        )
+        phase_noisy = phase_noisy + decorr["phase_noise_rad"]
+        coherence = decorr["coherence"]
+        decorrelation_weights = {
+            "vegetation": decorr["vegetation_weight"],
+            "snow": decorr["snow_weight"],
+            "rupture": decorr["rupture_weight"],
+        }
+
+    # Wrap noisy phase
+    if wrap:
+        phase_noisy = wrap_phase(phase_noisy)
+
+    # Package metadata
+    metadata = {
+        # Source parameters
+        "Mw": Mw,
+        "M0_Nm": M0,
+        "strike_deg": strike_deg,
+        "dip_deg": dip_deg,
+        "rake_deg": rake_deg,
+        "xcen_km": xcen_km,
+        "ycen_km": ycen_km,
+        "depth_km": depth_km,
+        "source_type": "davis",
+        # Grid parameters
+        "grid_extent_km": grid_extent_km,
+        "grid_spacing_km": grid_spacing_km,
+        # Elastic parameters
+        "nu": nu,
+        "mu_Pa": mu,
+        # InSAR geometry
+        "satellite": satellite_name,
+        "orbit": orbit,
+        "incidence_deg": incidence_deg,
+        "heading_deg": heading_deg,
+        "wavelength_m": wavelength_m,
+        # Noise parameters
+        "noise_amplitude_m": noise_amplitude_m,
+        "noise_model": noise_model,
+        "noise_beta": noise_beta if noise_model == "correlated" else None,
+        # Decorrelation parameters
+        "add_decorrelation": add_decorrelation,
+        "decorrelation_params": _metadata_safe(decorr_kwargs),
+    }
+
+    output = {
+        "X_km": X_km,
+        "Y_km": Y_km,
+        "Ue": Ue,
+        "Un": Un,
+        "Uz": Uz,
+        "los_displacement": d_los,
+        "phase_unwrapped": phase_unwrapped,
+        "phase_wrapped": phase_wrapped,
+        "phase_noisy": phase_noisy,
+        "metadata": metadata,
+    }
+    if add_decorrelation:
+        output["coherence"] = coherence
+        output["decorrelation_weights"] = decorrelation_weights
+    return output
+
+
+def _metadata_safe(params: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Drop array-valued entries (user masks) so metadata stays serialisable."""
+    if params is None:
+        return None
+    return {k: ("<array>" if isinstance(v, np.ndarray) else v)
+            for k, v in params.items()}
